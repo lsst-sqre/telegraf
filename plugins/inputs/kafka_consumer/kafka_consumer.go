@@ -295,6 +295,7 @@ func (k *KafkaConsumer) startErrorAdder(acc telegraf.Accumulator) {
 		}
 	}()
 }
+	
 
 func (k *KafkaConsumer) getNewHandler(acc telegraf.Accumulator) *ConsumerGroupHandler {
 	handler := NewConsumerGroupHandler(acc, k.MaxUndeliveredMessages, k.parser, k.Log)
@@ -390,6 +391,9 @@ func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
 		acc.AddError(err)
 		return err
 	}
+	k.Log.Debug("destroying old consumer goroutines")
+	k.cancel()
+	k.wg.Wait()
 	k.Log.Debug("creating new consumer group")
 	newConsumer, err := k.ConsumerCreator.Create(
 		k.Brokers,
