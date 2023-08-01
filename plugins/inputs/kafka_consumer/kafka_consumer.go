@@ -84,7 +84,6 @@ type KafkaConsumer struct {
 // 2: Clean shutdown of timer ticker: looks like wrapping it in its own
 // Context and Waitgroup should work.
 
-
 type ConsumerGroup interface {
 	Consume(ctx context.Context, topics []string, handler sarama.ConsumerGroupHandler) error
 	Errors() <-chan error
@@ -309,7 +308,7 @@ func (k *KafkaConsumer) handleTicker(acc telegraf.Accumulator) {
 	k.Log.Infof("starting refresh ticker: scanning topics every %s", dstr)
 	for {
 		select {
-		case <- k.stopTicker:
+		case <-k.stopTicker:
 			k.Log.Debug("received stop signal")
 			return
 		default:
@@ -358,11 +357,6 @@ func (k *KafkaConsumer) consumeTopics(ctx context.Context, acc telegraf.Accumula
 }
 
 func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
-	// This is tricky.  As soon as we call k.cancel() the old
-	// consumer group is no longer usable, so we need to get
-	// a new group and context ready and then pull a switcheroo
-	// quickly.
-	//
 	// Up to 100Hz, at least, we do not lose messages on consumer group
 	// restart.  Since the group name is the same, it seems very likely
 	// that we just pick up at the offset we left off at: that is the
@@ -372,9 +366,18 @@ func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
 		// Fast exit if the consumer isn't running
 		return nil
 	}
-	k.Log.Info("restarting consumer group")
+
+	k.groupLock.Lock()
+	// Do the switcheroo.
+	k.Log.Debug("replacing consumer group")
+	k.Log.Debug("closing old consumer group")
+	err := k.consumer.Close()
+	if err != nil {
+		acc.AddError(err)
+		return err
+	}
 	k.Log.Debug("creating new consumer group")
-	newConsumer, err := k.ConsumerCreator.Create(
+	k.consumer, err = k.ConsumerCreator.Create(
 		k.Brokers,
 		k.ConsumerGroup,
 		k.config,
@@ -383,25 +386,8 @@ func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
 		acc.AddError(err)
 		return err
 	}
-	k.Log.Debug("acquiring new context before swapping consumer groups")
-	ctx, cancel := context.WithCancel(context.Background())
-	// I am not sure we really need this lock, but if it hurts we're
-	// already refreshing way too frequently.
-	k.groupLock.Lock()
-	// Do the switcheroo.
-	k.Log.Debug("replacing consumer group")
-	oldConsumer := k.consumer
-	oldCancel := k.cancel
-	k.consumer = newConsumer
-	k.cancel = cancel
-	k.Log.Debug("closing old consumer group")
-	err = oldConsumer.Close()
-	if err != nil {
-		acc.AddError(err)
-		return err  // Should this be fatal?  Or should we
-		// accumulate it and keep going?
-	}
-	oldCancel()
+	ctx, ccl := context.WithCancel(context.Background())
+	k.cancel = ccl
 	k.groupLock.Unlock()
 	k.Log.Debug("starting new consumer group")
 	k.consumeTopics(ctx, acc)
@@ -474,7 +460,8 @@ func (k *KafkaConsumer) Stop() {
 	if k.ticker != nil {
 		k.stopTicker <- true
 		k.ticker.Stop()
-		
+		k.refreshCancel()
+		k.refreshWg.Wait()
 	}
 	// Lock so that a topic refresh cannot start while we are stopping.
 	k.topicLock.Lock()
