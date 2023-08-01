@@ -719,6 +719,10 @@ func TestDynamicTopicRefresh(t *testing.T) {
 				require.Error(t, err)
 				return
 			}
+
+			// Wait a little while on a hunch
+			time.Sleep(5 * time.Second)
+
 			// Shove some metrics through
 			expected := testutil.MockMetrics()
 			t.Logf("rt: writing %v to %s", expected, output.Topic)

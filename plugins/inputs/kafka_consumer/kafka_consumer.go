@@ -65,7 +65,7 @@ type KafkaConsumer struct {
 	refreshCancel   context.CancelFunc
 	refreshWg       sync.WaitGroup
 	ticker          *time.Ticker
-	stopTicker      chan bool
+	stopTicker      bool
 	fingerprint     string
 
 	parser    telegraf.Parser
@@ -307,25 +307,38 @@ func (k *KafkaConsumer) handleTicker(acc telegraf.Accumulator) {
 	dstr := time.Duration(k.TopicRefreshInterval).String()
 	k.Log.Infof("starting refresh ticker: scanning topics every %s", dstr)
 	for {
-		select {
-		case <-k.stopTicker:
-			k.Log.Debug("received stop signal")
+		// Grab a copy of k.stopTicker; if we miss it, we just do
+		// one extra pass
+		k.Log.Debug("about to get lock for stopticker in handleTicker()")
+		k.topicLock.Lock()
+		k.Log.Debug("got lock for stopticker in handleTicker()")
+		st := k.stopTicker
+		k.topicLock.Unlock()
+		k.Log.Debug("released lock for stopticker in handleTicker()")
+		if st {
+			k.Log.Debug("ticker should stop")
 			return
-		default:
-			<-k.ticker.C
-			k.Log.Debugf("received topic refresh request (every %s)", dstr)
-			changed, err := k.changedTopics()
+		}
+		<-k.ticker.C
+		k.Log.Debugf("received topic refresh request (every %s)", dstr)
+		changed, err := k.changedTopics()
+		if err != nil {
+			acc.AddError(err)
+			return
+		}
+		if changed {
+			// We need the lock
+			k.Log.Debug("about to get lock from handleTicker()")
+			k.topicLock.Lock()
+			k.Log.Debug("lock acquired: handleTicker()")
+			err = k.restartConsumer(acc)
 			if err != nil {
 				acc.AddError(err)
+				k.topicLock.Unlock()
 				return
 			}
-			if changed {
-				err = k.restartConsumer(acc)
-				if err != nil {
-					acc.AddError(err)
-					return
-				}
-			}
+			k.Log.Debug("releasing lock in handleTicker()")
+			k.topicLock.Unlock()
 		}
 	}
 }
@@ -339,10 +352,13 @@ func (k *KafkaConsumer) consumeTopics(ctx context.Context, acc telegraf.Accumula
 			// We need to copy allWantedTopics; the Consume() is
 			// long-running and we can easily deadlock if our
 			// topic-update-checker fires.
+			k.Log.Debug("about to get lock from consumeTopics()")
 			k.topicLock.Lock()
+			k.Log.Debug("acquired lock in consumeTopics()")
 			topics := make([]string, len(k.allWantedTopics))
 			copy(topics, k.allWantedTopics)
 			k.topicLock.Unlock()
+			k.Log.Debug("lock released in consumeTopics()")
 			err := k.consumer.Consume(ctx, topics, handler)
 			if err != nil {
 				acc.AddError(fmt.Errorf("consume: %w", err))
@@ -366,8 +382,6 @@ func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
 		// Fast exit if the consumer isn't running
 		return nil
 	}
-
-	k.groupLock.Lock()
 	// Do the switcheroo.
 	k.Log.Debug("replacing consumer group")
 	k.Log.Debug("closing old consumer group")
@@ -377,7 +391,7 @@ func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
 		return err
 	}
 	k.Log.Debug("creating new consumer group")
-	k.consumer, err = k.ConsumerCreator.Create(
+	newConsumer, err := k.ConsumerCreator.Create(
 		k.Brokers,
 		k.ConsumerGroup,
 		k.config,
@@ -387,8 +401,14 @@ func (k *KafkaConsumer) restartConsumer(acc telegraf.Accumulator) error {
 		return err
 	}
 	ctx, ccl := context.WithCancel(context.Background())
+	k.Log.Debug("about to acquire groupLock in restartConsumer()")
+	k.groupLock.Lock()
+	k.Log.Debug("acquired groupLock in restartConsumer()")
+	k.Log.Debug("replacing k.consumer and k.cancel")
+	k.consumer = newConsumer
 	k.cancel = ccl
 	k.groupLock.Unlock()
+	k.Log.Debug("released groupLock in restartConsumer()")
 	k.Log.Debug("starting new consumer group")
 	k.consumeTopics(ctx, acc)
 	k.Log.Info("restarted consumer group")
@@ -457,11 +477,17 @@ func (k *KafkaConsumer) Gather(_ telegraf.Accumulator) error {
 }
 
 func (k *KafkaConsumer) Stop() {
+	k.Log.Debug("Stop() called")
 	if k.ticker != nil {
-		k.stopTicker <- true
+		k.Log.Debug("stopping ticker")
 		k.ticker.Stop()
+		k.Log.Debug("stopped ticker, setting k.StopTicker")
+		k.stopTicker = true
+		k.Log.Debug("calling refreshCancel()")
 		k.refreshCancel()
+		k.Log.Debug("waiting on refreshWg")
 		k.refreshWg.Wait()
+		k.Log.Debug("refreshWg awaited")
 	}
 	// Lock so that a topic refresh cannot start while we are stopping.
 	k.topicLock.Lock()
