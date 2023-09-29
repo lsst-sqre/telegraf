@@ -82,6 +82,14 @@ func (p *Parser) Init() error {
 	return nil
 }
 
+func (p *Parser) Clone() (*Parser) {
+	// This particular parser is thread-safe, so we can share it
+	// between measurements...which is good, because otherwise the
+	// schema cache doesn't work and we make a network call to the
+	// schema registry with each measurement.
+	return p
+}
+
 func (p *Parser) Parse(buf []byte) ([]telegraf.Metric, error) {
 	var schema string
 	var codec *goavro.Codec
